@@ -20,6 +20,8 @@ var (
 	ContentType          = "application/rim+cbor"
 	NoExternalData       = []byte("")
 	HeaderLabelCorimMeta = int64(8)
+
+	errNoSign1Message = errors.New("no Sign1 message found")
 )
 
 // SignedCorim encodes a signed-corim message (i.e., a COSE Sign1 wrapped CoRIM)
@@ -117,38 +119,13 @@ func (o *SignedCorim) extractMeta(v interface{}) error {
 }
 
 func (o *SignedCorim) extractX5Chain(x5chain interface{}) error {
-	var buf bytes.Buffer
-
-	switch t := x5chain.(type) {
-	case []interface{}:
-		for i, elem := range t {
-			cert, ok := elem.([]byte)
-			if !ok {
-				return fmt.Errorf("accessing x5chain[%d]: got %T, want []byte", i, elem)
-			}
-
-			switch i {
-			case 0:
-				if err := o.AddSigningCert(cert); err != nil {
-					return fmt.Errorf("decoding x5chain: %w", err)
-				}
-			default:
-				buf.Write(cert)
-			}
-		}
-
-		if buf.Len() > 0 {
-			if err := o.AddIntermediateCerts(buf.Bytes()); err != nil {
-				return fmt.Errorf("decoding x5chain: %w", err)
-			}
-		}
-	case []byte:
-		if err := o.AddSigningCert(t); err != nil {
-			return fmt.Errorf("decoding x5chain: %w", err)
-		}
-	default:
-		return fmt.Errorf("decoding x5chain: got %T, want []interface{} or []byte", t)
+	chain, err := cose.ParseX5Chain(x5chain)
+	if err != nil {
+		return err
 	}
+
+	o.SigningCert = chain.Leaf
+	o.IntermediateCerts = chain.Intermediates
 
 	return nil
 }
@@ -159,6 +136,17 @@ func (o *SignedCorim) extractX5Chain(x5chain interface{}) error {
 // field while the corim-meta-map is decoded into the Meta field.
 func (o *SignedCorim) FromCOSE(buf []byte) error {
 	o.message = cose.NewSign1Message()
+	o.SigningCert = nil
+	o.IntermediateCerts = nil
+
+	var err error
+	defer func() {
+		if err != nil {
+			o.message = nil
+			o.SigningCert = nil
+			o.IntermediateCerts = nil
+		}
+	}()
 
 	// If a tagged-corim-type-choice #6.500 of tagged-signed-corim #6.502, strip the prefix.
 	// This is a remnant of an older draft of the specification before
@@ -166,19 +154,19 @@ func (o *SignedCorim) FromCOSE(buf []byte) error {
 	corimTypeChoice := []byte("\xd9\x01\xf4\xd9\x01\xf6")
 	buf, _ = bytes.CutPrefix(buf, corimTypeChoice)
 
-	if err := o.message.UnmarshalCBOR(buf); err != nil {
+	if err = o.message.UnmarshalCBOR(buf); err != nil {
 		return fmt.Errorf("failed CBOR decoding for COSE-Sign1 signed CoRIM: %w", err)
 	}
 
-	if err := o.processHdrs(); err != nil {
+	if err = o.processHdrs(); err != nil {
 		return fmt.Errorf("processing COSE headers: %w", err)
 	}
 
-	if err := o.UnsignedCorim.FromCBOR(o.message.Payload); err != nil {
+	if err = o.UnsignedCorim.FromCBOR(o.message.Payload); err != nil {
 		return fmt.Errorf("failed CBOR decoding of unsigned CoRIM: %w", err)
 	}
 
-	if err := o.UnsignedCorim.Valid(); err != nil {
+	if err = o.UnsignedCorim.Valid(); err != nil {
 		return fmt.Errorf("failed validation of unsigned CoRIM: %w", err)
 	}
 
@@ -261,17 +249,13 @@ func (o *SignedCorim) Sign(signer cose.Signer) ([]byte, error) {
 	}
 
 	if o.SigningCert != nil {
-		// COSE_X509 = bstr / [ 2*certs: bstr ]
-		//
-		// handle alt (1): bstr
-		if len(o.IntermediateCerts) == 0 {
-			o.message.Headers.Protected[cose.HeaderLabelX5Chain] = o.SigningCert.Raw
-		} else { // handle alt (2): [ 2*certs: bstr ]
-			certChain := [][]byte{o.SigningCert.Raw}
-			for _, cert := range o.IntermediateCerts {
-				certChain = append(certChain, cert.Raw)
-			}
-			o.message.Headers.Protected[cose.HeaderLabelX5Chain] = certChain
+		chain := cose.X5Chain{
+			Leaf:          o.SigningCert,
+			Intermediates: o.IntermediateCerts,
+		}
+		err = cose.SetX5Chain(o.message.Headers.Protected, chain)
+		if err != nil {
+			return nil, err
 		}
 	} else if o.IntermediateCerts != nil {
 		return nil, errors.New("intermediate certificates supplied but no signing certificate")
@@ -294,7 +278,7 @@ func (o *SignedCorim) Sign(signer cose.Signer) ([]byte, error) {
 // supplied public key
 func (o *SignedCorim) Verify(pk crypto.PublicKey) error {
 	if o.message == nil {
-		return errors.New("no Sign1 message found")
+		return errNoSign1Message
 	}
 
 	protected := o.message.Headers.Protected
