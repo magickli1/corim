@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/veraison/corim/extensions"
 	cose "github.com/veraison/go-cose"
@@ -119,105 +118,30 @@ func (o *SignedCorim) extractMeta(v interface{}) error {
 	return nil
 }
 
+// extractX5Chain decodes the x5chain header with cose.ParseX5Chain, which
+// requires the certificates in chain order and checks each certificate's
+// signature against the next. The certificate fields are set only on success.
+//
+// Reference: https://www.rfc-editor.org/rfc/rfc9360.html#section-2
 func (o *SignedCorim) extractX5Chain(x5chain interface{}) error {
-	var (
-		signingCert       *x509.Certificate
-		intermediateCerts []*x509.Certificate
-		err               error
-	)
-
-	switch t := x5chain.(type) {
-	case []interface{}:
-		elems := make([][]byte, len(t))
-		for i, elem := range t {
-			certDER, ok := elem.([]byte)
-			if !ok {
-				return fmt.Errorf("accessing x5chain[%d]: got %T, want []byte", i, elem)
-			}
-
-			elems[i] = certDER
-		}
-
-		signingCert, intermediateCerts, err = parseX5ChainFromCertDERs(elems)
-	case [][]byte:
-		signingCert, intermediateCerts, err = parseX5ChainFromCertDERs(t)
-	case []byte:
-		signingCert, err = parseX5ChainLeafDER(t)
-	default:
-		return fmt.Errorf("decoding x5chain: got %T, want []interface{}, [][]byte, or []byte", t)
-	}
-
+	chain, err := cose.ParseX5Chain(x5chain)
 	if err != nil {
 		return err
 	}
 
-	o.SigningCert = signingCert
-	o.IntermediateCerts = intermediateCerts
+	o.SigningCert = chain.Leaf
+	o.IntermediateCerts = chain.Intermediates
 
 	return nil
-}
-
-func parseX5ChainFromCertDERs(elems [][]byte) (leaf *x509.Certificate, intermediates []*x509.Certificate, err error) {
-	if len(elems) == 0 {
-		return nil, nil, fmt.Errorf("decoding x5chain: empty certificate array")
-	}
-
-	leaf, err = parseX5ChainLeafDER(elems[0])
-	if err != nil {
-		return nil, nil, err
-	}
-
-	intermediates = make([]*x509.Certificate, 0, len(elems)-1)
-	for i := 1; i < len(elems); i++ {
-		var parsed *x509.Certificate
-		parsed, err = parseX5ChainIntermediateDER(elems[i], i)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		intermediates = append(intermediates, parsed)
-	}
-
-	return leaf, intermediates, nil
-}
-
-func parseX5ChainLeafDER(der []byte) (*x509.Certificate, error) {
-	if der == nil {
-		return nil, fmt.Errorf("decoding x5chain: nil signing cert")
-	}
-	if len(der) == 0 {
-		return nil, fmt.Errorf("decoding x5chain: empty signing cert")
-	}
-
-	parsed, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, fmt.Errorf("decoding x5chain: invalid signing certificate: %w", err)
-	}
-
-	return parsed, nil
-}
-
-func parseX5ChainIntermediateDER(der []byte, index int) (*x509.Certificate, error) {
-	if len(der) == 0 {
-		return nil, fmt.Errorf("decoding x5chain: empty intermediate cert at index %d", index)
-	}
-
-	certs, err := x509.ParseCertificates(der)
-	if err != nil {
-		return nil, fmt.Errorf("decoding x5chain: invalid intermediate certificate at index %d: %w", index, err)
-	}
-
-	if len(certs) != 1 {
-		return nil, fmt.Errorf("decoding x5chain: expected 1 certificate at index %d, got %d", index, len(certs))
-	}
-
-	return certs[0], nil
 }
 
 // FromCOSE decodes and effects syntactic validation on the supplied
 // signed-corim message, including the embedded unsigned-corim and corim-meta.
 // On success, the unsigned-corim-map is made available via the UnsignedCorim
 // field while the corim-meta-map is decoded into the Meta field.
+//
+// An x5chain header, if present, must be in chain order, each certificate
+// signed by the next; otherwise decoding fails.
 func (o *SignedCorim) FromCOSE(buf []byte) error {
 	o.message = cose.NewSign1Message()
 	o.SigningCert = nil
@@ -278,6 +202,10 @@ func (o *SignedCorim) AddSigningCert(der []byte) error {
 // AddIntermediateCerts adds DER-encoded X.509 certificates to be included in the protected
 // header of the COSE Sign1 message as part of the X5Chain.
 // The certificates must be concatenated with no intermediate padding, as per X.509 convention.
+// They must be in chain order, starting with the signing certificate's issuer;
+// Sign rejects any other order.
+//
+// Reference: https://www.rfc-editor.org/rfc/rfc9360.html#section-2
 func (o *SignedCorim) AddIntermediateCerts(der []byte) error {
 	if len(der) == 0 {
 		return errors.New("nil or empty intermediate certs")
@@ -335,17 +263,13 @@ func (o *SignedCorim) Sign(signer cose.Signer) ([]byte, error) {
 	}
 
 	if o.SigningCert != nil {
-		// COSE_X509 = bstr / [ 2*certs: bstr ]
-		//
-		// handle alt (1): bstr
-		if len(o.IntermediateCerts) == 0 {
-			o.message.Headers.Protected[cose.HeaderLabelX5Chain] = o.SigningCert.Raw
-		} else { // handle alt (2): [ 2*certs: bstr ]
-			certChain := [][]byte{o.SigningCert.Raw}
-			for _, cert := range o.IntermediateCerts {
-				certChain = append(certChain, cert.Raw)
-			}
-			o.message.Headers.Protected[cose.HeaderLabelX5Chain] = certChain
+		// x5chain is an ordered array starting with the signing certificate,
+		// each followed by its issuer. SetX5Chain rejects any other order and
+		// encodes a leaf-only chain as a single bstr.
+		// Reference: https://www.rfc-editor.org/rfc/rfc9360.html#section-2
+		chain := cose.X5Chain{Leaf: o.SigningCert, Intermediates: o.IntermediateCerts}
+		if err = cose.SetX5Chain(o.message.Headers.Protected, chain); err != nil {
+			return nil, fmt.Errorf("setting x5chain: %w", err)
 		}
 	} else if o.IntermediateCerts != nil {
 		return nil, errors.New("intermediate certificates supplied but no signing certificate")
@@ -391,46 +315,20 @@ func (o *SignedCorim) Verify(pk crypto.PublicKey) error {
 	return nil
 }
 
-// VerifyWithX5Chain validates the embedded x5chain and CoRIM COSE signature.
+// VerifyWithX5Chain validates the x5chain in the protected header and the CoRIM
+// COSE signature using [cose.Sign1Message.VerifyWithX5Chain]. The x5chain must
+// be ordered leaf first, each certificate issued by the next. The signing
+// certificate must not be a CA and, when keyUsage is present, must include
+// digitalSignature.
 // Call [SignedCorim.FromCOSE] first. For external-key verify without PKIX, use [SignedCorim.Verify].
 // Load trust material via [LoadTrustAnchors] when reading anchors/CRLs from files.
-//
-// Leaf policy rejects CA certificates. keyUsage is optional; when present,
-// digitalSignature is required. PKIX validation uses ExtKeyUsageAny.
-func (o *SignedCorim) VerifyWithX5Chain(anchors TrustAnchors) error {
+func (o *SignedCorim) VerifyWithX5Chain(anchors TrustAnchors) error { //nolint:gocritic // keep by-value API for callers
 	if o.message == nil {
 		return errNoSign1Message
 	}
 
-	if o.SigningCert == nil {
-		return errors.New("x5chain: header not set in CoRIM")
-	}
+	coseAnchors, opts := anchors.toCOSE()
+	_, err := o.message.VerifyWithX5Chain(NoExternalData, coseAnchors, opts)
 
-	chain := make([]*x509.Certificate, 0, 1+len(o.IntermediateCerts))
-	chain = append(chain, o.SigningCert)
-	chain = append(chain, o.IntermediateCerts...)
-
-	now := anchors.CurrentTime
-	if now.IsZero() {
-		now = time.Now()
-	}
-
-	if err := validateLeafSigningCert(o.SigningCert); err != nil {
-		return err
-	}
-
-	verifiedChain, err := verifyPKIXChain(chain, anchors, now)
-	if err != nil {
-		return err
-	}
-
-	if err := checkChainRevocation(verifiedChain, anchors.CRLs, anchors.CrlPolicy, now); err != nil {
-		return err
-	}
-
-	if err := o.Verify(verifiedChain[0].PublicKey); err != nil {
-		return fmt.Errorf("x5chain: COSE signature verification failed: %w", err)
-	}
-
-	return nil
+	return err
 }

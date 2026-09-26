@@ -90,8 +90,8 @@ func ExampleLoadTrustAnchors() {
 		log.Fatal(err)
 	}
 
-	if anchors.Pool == nil {
-		log.Fatal("expected explicit trust-anchor pool")
+	if len(anchors.Anchors) == 0 {
+		log.Fatal("expected explicit trust anchors")
 	}
 	// Output:
 }
