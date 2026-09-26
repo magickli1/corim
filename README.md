@@ -35,9 +35,16 @@ Signed CoRIM messages may carry an X.509 chain in the COSE `x5chain` protected h
 Use [`SignedCorim.VerifyWithX5Chain`](https://pkg.go.dev/github.com/veraison/corim/corim#SignedCorim.VerifyWithX5Chain)
 after [`FromCOSE`](https://pkg.go.dev/github.com/veraison/corim/corim#SignedCorim.FromCOSE) to validate PKIX trust, optional CRL revocation, and the COSE signature.
 
+PKIX and CRL checking are implemented by [`github.com/veraison/go-cose`](https://pkg.go.dev/github.com/veraison/go-cose).
 Load trust material with [`LoadTrustAnchors`](https://pkg.go.dev/github.com/veraison/corim/corim#LoadTrustAnchors).
-When no trust-anchor paths are supplied, verification uses the OS certificate store; for production deployments, pass explicit anchors.
+When no trust-anchor paths are supplied, `LoadTrustAnchors` sets `UseSystemRoots` so verification uses the OS certificate store; for production deployments, pass explicit anchors.
+A zero-value [`TrustAnchors`](https://pkg.go.dev/github.com/veraison/corim/corim#TrustAnchors) (empty `Anchors` and `UseSystemRoots` false) does **not** use the OS store — verification fails closed. Prefer `LoadTrustAnchors` or set `UseSystemRoots` / `Anchors` explicitly.
+Trust-anchor and CRL files may be DER or PEM; PEM files must contain only `CERTIFICATE` (respectively `X509 CRL`) blocks. Whitespace and `#` comment lines are allowed around blocks; other text and block types are rejected.
 When no CRL paths are supplied, revocation checks are skipped; when CRLs are loaded, [`CrlPolicyStrict`](https://pkg.go.dev/github.com/veraison/corim/corim#CrlPolicyStrict) is the default.
+[`RevocationMode`](https://pkg.go.dev/github.com/veraison/corim/corim#RevocationMode) selects which certificates are checked against CRLs: the full chain (default), the signing certificate only, or none.
+[`CrlPolicyPermissive`](https://pkg.go.dev/github.com/veraison/corim/corim#CrlPolicyPermissive) only allows a selected certificate to lack an applicable CRL; any CRL that is used must still include `ThisUpdate` and `NextUpdate`.
+The `x5chain` header must list the signing certificate first, each certificate followed by its issuer.
+Use `errors.Is` with `ErrX5ChainNoTrust`, `ErrX5ChainCRLMissing`, `ErrX5ChainRevoked` or `ErrX5ChainSignature` to tell failure causes apart.
 
 For external-key verification without PKIX path validation, use [`SignedCorim.Verify`](https://pkg.go.dev/github.com/veraison/corim/corim#SignedCorim.Verify) instead.
 
